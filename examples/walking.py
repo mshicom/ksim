@@ -220,7 +220,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
 
     # Distributed training parameters.
     use_distributed: bool = xax.field(
-        value=False,
+        value=True,
         help="Whether to use distributed training across multiple devices.",
     )
 
@@ -598,7 +598,7 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
             ksim.CenterOfMassVelocityObservation(),
             ksim.ProjectedGravityObservation.create(
                 physics_model=physics_model,
-                framequat_name="imu_quat",
+                framequat_name="orientation",
                 lag_range=(0.3, 0.7),
                 noise=0.0,
             ),
@@ -740,6 +740,33 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
         )
 
         return model.forward(obs_n)
+
+    def get_ppo_variables(
+        self,
+        model: Model,
+        trajectory: ksim.Trajectory,
+        model_carry: None,
+        rng: PRNGKeyArray,
+    ) -> tuple[ksim.PPOVariables, None]:
+        # Vectorize over the time dimensions.
+        def get_log_prob(transition: ksim.Trajectory) -> Array:
+            action_dist_tj = self.run_actor(model.actor, transition.obs, transition.command)
+            log_probs_tj = action_dist_tj.log_prob(transition.action)
+            assert isinstance(log_probs_tj, Array)
+            return log_probs_tj
+
+        log_probs_tj = jax.vmap(get_log_prob)(trajectory)
+        assert isinstance(log_probs_tj, Array)
+
+        # Vectorize over the time dimensions.
+        values_tj = jax.vmap(self.run_critic, in_axes=(None, 0, 0))(model.critic, trajectory.obs, trajectory.command)
+
+        ppo_variables = ksim.PPOVariables(
+            log_probs=log_probs_tj,
+            values=values_tj.squeeze(-1),
+        )
+
+        return ppo_variables, None
 
     def sample_action(
         self,
