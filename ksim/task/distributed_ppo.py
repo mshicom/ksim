@@ -47,11 +47,10 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
         init_carry: PyTree,
         on_policy_variables: PPOVariables,
         rng: PRNGKeyArray,
-        step_count: int,  # Added parameter for gradient sync control
     ) -> tuple[xax.FrozenDict[str, Array], LoggedTrajectory, PyTree]:
-        """Override to add gradient synchronization with configurable frequency."""
-        # Get metrics and gradients using the parent method
-        metrics, logged_trajectory, grads = super()._get_ppo_metrics_and_grads(
+        """Override to remove step_count parameter and use default gradient sync."""
+        # Use the parent implementation without step_count
+        return super(DistributedPPOTask, self)._get_ppo_metrics_and_grads(
             model_arr,
             model_static,
             trajectories,
@@ -60,62 +59,35 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             on_policy_variables,
             rng,
         )
-        
-        # Conditionally synchronize gradients
-        should_sync = step_count % self.config.gradient_sync_period == 0
-        
-        def sync_fn(g):
-            return jax.lax.cond(
-                should_sync,
-                lambda x: jax.lax.pmean(x, axis_name=_PMAP_AXIS_NAME),
-                lambda x: x,
-                g
-            )
-        
-        synced_grads = jax.tree.map(sync_fn, grads)
-        
-        return metrics, logged_trajectory, synced_grads
     
     @xax.jit(static_argnames=["self", "constants"], jit_level=JitLevel.RL_CORE)
-    def pmapped_update_model(
+    def update_model(
         self,
         constants: RLLoopConstants,
         carry: RLLoopCarry,
         trajectories: Trajectory,
         rewards: RewardState,
         rng: PRNGKeyArray,
-        step_count: int,  # Added parameter for gradient sync control
     ) -> tuple[RLLoopCarry, xax.FrozenDict[str, Array], LoggedTrajectory]:
-        """pmap-compatible version of update_model for distributed PPO training."""
+        """Override update_model for distributed training."""
         # Gets the policy model.
         policy_model_arr = carry.shared_state.model_arrs[0]
         policy_model_static = constants.constants.model_statics[0]
         policy_model = eqx.combine(policy_model_arr, policy_model_static)
 
         # Runs the policy model on the trajectory to get the PPO variables.
-        # Note: We're operating on a slice of the environments now
+        # Use the actual number of environments per device instead of total environments
         num_envs_per_device = trajectories.done.shape[0]
         on_policy_rngs = jax.random.split(rng, num_envs_per_device)
-        
-        ppo_fn = xax.vmap(
-            self.get_ppo_variables, 
-            in_axes=(None, 0, 0, 0), 
-            jit_level=JitLevel.RL_CORE
-        )
-        
-        on_policy_variables, _ = ppo_fn(
-            policy_model, 
-            trajectories, 
-            carry.env_states.model_carry, 
-            on_policy_rngs
-        )
-        
-        on_policy_variables = jax.tree.map(
-            lambda x: jax.lax.stop_gradient(x), 
-            on_policy_variables
-        )
+        ppo_fn = xax.vmap(self.get_ppo_variables, in_axes=(None, 0, 0, 0), jit_level=JitLevel.RL_CORE)
+        on_policy_variables, _ = ppo_fn(policy_model, trajectories, carry.env_states.model_carry, on_policy_rngs)
+        on_policy_variables = jax.tree.map(lambda x: jax.lax.stop_gradient(x), on_policy_variables)
 
-        # Loops over the trajectory batches and applies gradient updates.
+        # Use device-local batch size
+        batch_size = self.config.batch_size // self.get_num_local_devices()
+        num_batches = num_envs_per_device // batch_size
+
+        # Rest of the method is the same as the parent class but with device-local parameters
         def update_model_in_batch(
             carry: RLLoopCarry,
             xs: tuple[Array, PRNGKeyArray],
@@ -129,15 +101,13 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             env_states_batch = jax.tree.map(lambda x: x[batch_indices], carry.env_states)
             on_policy_variables_batch = jax.tree.map(lambda x: x[batch_indices], on_policy_variables)
 
-            # Override _single_step to use the distributed version with step_count
-            next_carry, metrics, logged_traj = self._single_step_distributed(
+            next_carry, metrics, logged_traj = self._single_step(
                 trajectories=trajectory_batch,
                 rewards=reward_batch,
                 constants=constants,
                 carry=replace(carry, env_states=env_states_batch),
                 on_policy_variables=on_policy_variables_batch,
                 rng=batch_rng,
-                step_count=step_count,
             )
 
             # Update the carry's shared states.
@@ -148,10 +118,6 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             )
 
             return carry, (metrics, logged_traj)
-
-        # Define device-local batch size and number of batches
-        batch_size = self.config.batch_size // self.get_num_local_devices()
-        num_batches = num_envs_per_device // batch_size
 
         # Applies N steps of gradient updates.
         def update_model_across_batches(
@@ -211,122 +177,9 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
                 ),
             )
 
-        # Optionally verify state consistency
-        if self.config.verify_state_consistency:
-            is_consistent = self.verify_state_consistency(carry.shared_state.model_arrs)
-            # Use debug print to report consistency without affecting computation
-            jax.debug.print("Model consistency check: {}", is_consistent)
-
         return carry, metrics, logged_traj
     
-    @xax.jit(static_argnames=["self", "constants"], jit_level=JitLevel.RL_CORE)
-    def _single_step_distributed(
-        self,
-        trajectories: Trajectory,
-        rewards: RewardState,
-        constants: RLLoopConstants,
-        carry: RLLoopCarry,
-        on_policy_variables: PPOVariables,
-        rng: PRNGKeyArray,
-        step_count: int,  # Added parameter for gradient sync control
-    ) -> tuple[RLLoopCarry, xax.FrozenDict[str, Array], LoggedTrajectory]:
-        """Distributed version of _single_step that passes step_count to gradient computation."""
-        # Gets the policy model and optimizer.
-        model_arr = carry.shared_state.model_arrs[0]
-        model_static = constants.constants.model_statics[0]
-        optimizer = constants.optimizer[0]
-        opt_state = carry.opt_state[0]
-
-        # Computes the metrics and PPO gradients with step count for sync control
-        ppo_metrics, logged_trajectory, grads = self._get_ppo_metrics_and_grads(
-            model_arr=model_arr,
-            model_static=model_static,
-            trajectories=trajectories,
-            rewards=rewards,
-            init_carry=carry.env_states.model_carry,
-            on_policy_variables=on_policy_variables,
-            rng=rng,
-            step_count=step_count,
-        )
-
-        # Applies the gradients with clipping.
-        new_model_arr, new_opt_state, grad_metrics = self.apply_gradients_with_clipping(
-            model_arr=model_arr,
-            grads=grads,
-            optimizer=optimizer,
-            opt_state=opt_state,
-        )
-
-        # Updates the carry with the new model and optimizer states.
-        carry = replace(
-            carry,
-            shared_state=replace(
-                carry.shared_state,
-                model_arrs=xax.tuple_insert(carry.shared_state.model_arrs, 0, new_model_arr),
-            ),
-            opt_state=xax.tuple_insert(carry.opt_state, 0, new_opt_state),
-        )
-
-        # Gets the metrics dictionary.
-        metrics: xax.FrozenDict[str, Array] = xax.FrozenDict(ppo_metrics.unfreeze() | grad_metrics)
-
-        return carry, metrics, logged_trajectory
-    
-    @xax.jit(static_argnames=["self", "constants"], jit_level=JitLevel.OUTER_LOOP)
-    def _rl_train_loop_step_distributed(
-        self,
-        carry: RLLoopCarry,
-        constants: RLLoopConstants,
-        state: xax.State,
-        rng: PRNGKeyArray,
-        step_count: int,  # Added parameter for gradient sync control
-    ) -> tuple[RLLoopCarry, tuple[Trajectory, RewardState], tuple[RLLoopCarry, xax.FrozenDict[str, Array], LoggedTrajectory]]:
-        """Distributed version of _rl_train_loop_step."""
-        # Rolls out a new trajectory using pmap instead of vmap
-        trajectories, rewards, env_state = self._pmap_single_unroll(
-            constants.constants,
-            carry.env_states,
-            carry.shared_state,
-        )
-        
-        # Update environment states
-        carry = replace(
-            carry,
-            env_states=env_state,
-        )
-        
-        # Run update on the trajectory
-        next_carry, train_metrics, logged_traj = self.pmapped_update_model(
-            constants=constants,
-            carry=carry,
-            trajectories=trajectories,
-            rewards=rewards,
-            rng=rng,
-            step_count=step_count,
-        )
-        
-        # Return everything needed by the outer loop
-        return next_carry, (trajectories, rewards), (next_carry, train_metrics, logged_traj)
-    
-    def _pmap_single_unroll(
-        self,
-        constants: RolloutConstants,
-        env_states: RolloutEnvState,
-        shared_state: RolloutSharedState,
-    ) -> tuple[Trajectory, RewardState, RolloutEnvState]:
-        """pmap-wrapped version of _single_unroll."""
-        # Create pmap version of _single_unroll
-        # env_states should be sharded along environment dimension
-        # constants and shared_state should be replicated
-        pmapped_unroll = jax.pmap(
-            self._single_unroll,
-            in_axes=(None, 0, None),
-            axis_name=_PMAP_AXIS_NAME,
-            static_broadcasted_argnums=(0,),
-        )
-        
-        # Call the pmapped function
-        return pmapped_unroll(constants, env_states, shared_state)
+    # Remove the distributed-specific methods since we're using the simpler approach
     
     def run_training(self) -> None:
         """Override run_training to use distributed training with multiple GPUs."""
@@ -374,17 +227,15 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             # Initialize training state in a distributed manner
             constants, carry, state = self.initialize_rl_training(mj_model, rng)
             
-            # Create pmapped version of rl_train_loop_step
-            # The carry.env_states should be sharded along the environment dimension
-            # carry.shared_state should be replicated (already replicated above)
-            # carry.opt_state should be replicated
+            # Create pmapped version of the regular rl_train_loop_step
+            # We'll use the regular RL training step but parallelize across devices
             pmapped_train_step = jax.pmap(
-                lambda c, const, s, r, step_count: self._rl_train_loop_step_distributed(
-                    c, const, s, r, step_count
+                lambda c, const, s, r: super(DistributedPPOTask, self)._rl_train_loop_step(
+                    carry=c, constants=const, state=s, rng=r
                 ),
-                in_axes=(RLLoopCarry(opt_state=None, env_states=0, shared_state=None), None, None, 0, None),
+                in_axes=(0, None, None, 0),
                 axis_name=_PMAP_AXIS_NAME,
-                static_broadcasted_argnums=(1, 4),  # Only constants and step_count should be static
+                static_broadcasted_argnums=(1,),  # Only constants should be static
             )
 
             # Check for weak types that could slow down compilation
@@ -415,8 +266,8 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             last_full_render_time = 0.0
             step_count = 0  # Counter for tracking sync periods
             
-            # Replicate the random key across environments
-            rngs = jax.random.split(rng, self.config.num_envs)
+            # Replicate the random key across devices 
+            rngs = jax.random.split(rng, num_devices)
             
             try:
                 while self._is_running and not self.is_training_over(state):
@@ -430,47 +281,29 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
 
                         state = self.on_step_start(state)
                         
-                        # Split RNG for each environment
+                        # Split RNG for each device (not for each environment)  
                         rng_splits = jax.vmap(jax.random.split)(rngs)
                         rngs, update_rngs = rng_splits[0], rng_splits[1]
                         
                         # Run distributed training step
-                        try:
-                            next_carry, (trajectories, rewards), (_, metrics_tuple, logged_trajs) = pmapped_train_step(
-                                carry,
-                                constants,
-                                state,
-                                update_rngs,
-                                step_count,
-                            )
-                        except Exception as e:
-                            # Debug information
-                            print(f"\nDEBUG: Error in pmapped_train_step")
-                            print(f"carry shape info:")
-                            for name, leaf in jax.tree.leaves_with_path(carry):
-                                if hasattr(leaf, 'shape'):
-                                    print(f"  {name}: shape {leaf.shape}")
-                                else:
-                                    print(f"  {name}: {type(leaf)}")
-                            print(f"update_rngs shape: {update_rngs.shape}")
-                            print(f"step_count: {step_count} (type: {type(step_count)})")
-                            print(f"state type: {type(state)}")
-                            raise e
+                        carry, metrics, logged_traj = pmapped_train_step(
+                            carry,
+                            constants,
+                            state,
+                            update_rngs,
+                        )
                         step_count += 1
-                        
-                        # Update carry
-                        carry = next_carry
                         
                         # Gather metrics from all devices (take mean across devices)
                         metrics = jax.tree.map(
                             lambda x: jnp.mean(x, axis=0),
-                            metrics_tuple
+                            metrics
                         )
                         
                         # Get the logged trajectory from the first device
                         logged_traj = jax.tree.map(
                             lambda x: x[0],
-                            logged_trajs
+                            logged_traj
                         )
 
                         if self.config.profile_memory:
