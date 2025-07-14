@@ -98,19 +98,17 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
         mj_model: Any,  # Using Any to avoid circular imports
         rng: PRNGKeyArray,
     ) -> tuple[RLLoopConstants, RLLoopCarry, xax.State]:
-        # Get base initialization
+        # Get base initialization without manual sharding
         constants, carry, state = super().initialize_rl_training(mj_model, rng)
         
-        # Shard environment states across devices
-        sharded_env_states = self.shard_env_states(carry.env_states)
-        
-        # Replicate shared state across devices
+        # For distributed training, we don't manually shard here
+        # Instead, we let pmap handle the sharding automatically
+        # Just replicate the shared state across devices
         replicated_shared_state = self.replicate_shared_state(carry.shared_state)
         
-        # Update carry
+        # Update carry with replicated shared state but keep env_states unsharded
         distributed_carry = replace(
             carry,
-            env_states=sharded_env_states,
             shared_state=replicated_shared_state,
         )
         

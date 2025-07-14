@@ -316,6 +316,8 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
     ) -> tuple[Trajectory, RewardState, RolloutEnvState]:
         """pmap-wrapped version of _single_unroll."""
         # Create pmap version of _single_unroll
+        # env_states should be sharded along environment dimension
+        # constants and shared_state should be replicated
         pmapped_unroll = jax.pmap(
             self._single_unroll,
             in_axes=(None, 0, None),
@@ -373,13 +375,16 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             constants, carry, state = self.initialize_rl_training(mj_model, rng)
             
             # Create pmapped version of rl_train_loop_step
+            # The carry.env_states should be sharded along the environment dimension
+            # carry.shared_state should be replicated (already replicated above)
+            # carry.opt_state should be replicated
             pmapped_train_step = jax.pmap(
                 lambda c, const, s, r, step_count: self._rl_train_loop_step_distributed(
                     c, const, s, r, step_count
                 ),
-                in_axes=(0, None, None, 0, None),
+                in_axes=(RLLoopCarry(opt_state=None, env_states=0, shared_state=None), None, None, 0, None),
                 axis_name=_PMAP_AXIS_NAME,
-                static_broadcasted_argnums=(1, 2),
+                static_broadcasted_argnums=(1, 4),  # Only constants and step_count should be static
             )
 
             # Check for weak types that could slow down compilation
@@ -410,8 +415,8 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
             last_full_render_time = 0.0
             step_count = 0  # Counter for tracking sync periods
             
-            # Replicate the random key across devices
-            rngs = jax.random.split(rng, num_devices)
+            # Replicate the random key across environments
+            rngs = jax.random.split(rng, self.config.num_envs)
             
             try:
                 while self._is_running and not self.is_training_over(state):
@@ -425,17 +430,32 @@ class DistributedPPOTask(PPOTask[Config], DistributedRLTask[Config], Generic[Con
 
                         state = self.on_step_start(state)
                         
-                        # Split RNG for each device
-                        rngs, update_rngs = jax.vmap(jax.random.split)(rngs)
+                        # Split RNG for each environment
+                        rng_splits = jax.vmap(jax.random.split)(rngs)
+                        rngs, update_rngs = rng_splits[0], rng_splits[1]
                         
                         # Run distributed training step
-                        next_carry, (trajectories, rewards), (_, metrics_tuple, logged_trajs) = pmapped_train_step(
-                            carry,
-                            constants,
-                            state,
-                            update_rngs,
-                            step_count,
-                        )
+                        try:
+                            next_carry, (trajectories, rewards), (_, metrics_tuple, logged_trajs) = pmapped_train_step(
+                                carry,
+                                constants,
+                                state,
+                                update_rngs,
+                                step_count,
+                            )
+                        except Exception as e:
+                            # Debug information
+                            print(f"\nDEBUG: Error in pmapped_train_step")
+                            print(f"carry shape info:")
+                            for name, leaf in jax.tree.leaves_with_path(carry):
+                                if hasattr(leaf, 'shape'):
+                                    print(f"  {name}: shape {leaf.shape}")
+                                else:
+                                    print(f"  {name}: {type(leaf)}")
+                            print(f"update_rngs shape: {update_rngs.shape}")
+                            print(f"step_count: {step_count} (type: {type(step_count)})")
+                            print(f"state type: {type(state)}")
+                            raise e
                         step_count += 1
                         
                         # Update carry
