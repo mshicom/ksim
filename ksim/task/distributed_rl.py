@@ -101,17 +101,28 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
         # Get base initialization
         constants, carry, state = super().initialize_rl_training(mj_model, rng)
         
-        # Shard environment states across devices
+        # For distributed training, we need to reshape the env_states to have
+        # a leading device dimension and replicate shared state
+        num_devices = self.get_num_local_devices()
+        num_envs_per_device = self.config.num_envs // num_devices
+        
+        # Reshape env_states to (num_devices, num_envs_per_device, ...)
         sharded_env_states = self.shard_env_states(carry.env_states)
         
         # Replicate shared state across devices
         replicated_shared_state = self.replicate_shared_state(carry.shared_state)
         
-        # Update carry
+        # Replicate opt_state across devices  
+        replicated_opt_state = jax.device_put_replicated(
+            carry.opt_state, jax.local_devices()[:num_devices]
+        )
+        
+        # Update carry with distributed components
         distributed_carry = replace(
             carry,
             env_states=sharded_env_states,
             shared_state=replicated_shared_state,
+            opt_state=replicated_opt_state,
         )
         
         return constants, distributed_carry, state
