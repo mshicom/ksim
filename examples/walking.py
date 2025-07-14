@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Any, Generic, Type, TypeVar
 
 import distrax
 import equinox as eqx
@@ -230,7 +230,7 @@ Config = TypeVar("Config", bound=HumanoidWalkingTaskConfig)
 
 class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
     """Single-device humanoid walking task."""
-    
+
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -522,7 +522,7 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
 
 class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Config]):
     """Multi-device distributed humanoid walking task."""
-    
+
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -676,21 +676,23 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
         joystick_command = commands["joystick_command"]
         joystick_command_one_hot = jax.nn.one_hot(joystick_command, 7)
 
-        obs_n = jnp.concatenate([
-            timestep_cos,
-            timestep_sin,
-            joint_position_observation,
-            joint_velocity_observation,
-            center_of_mass_inertia_observation,
-            center_of_mass_velocity_observation,
-            projected_gravity_observation,
-            actuator_force_observation,
-            base_position_observation,
-            base_orientation_observation,
-            base_linear_velocity_observation,
-            base_angular_velocity_observation,
-            joystick_command_one_hot,
-        ])
+        obs_n = jnp.concatenate(
+            [
+                timestep_cos,
+                timestep_sin,
+                joint_position_observation,
+                joint_velocity_observation,
+                center_of_mass_inertia_observation,
+                center_of_mass_velocity_observation,
+                projected_gravity_observation,
+                actuator_force_observation,
+                base_position_observation,
+                base_orientation_observation,
+                base_linear_velocity_observation,
+                base_angular_velocity_observation,
+                joystick_command_one_hot,
+            ]
+        )
 
         return model.forward(obs_n)
 
@@ -719,21 +721,23 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
         joystick_command = commands["joystick_command"]
         joystick_command_one_hot = jax.nn.one_hot(joystick_command, 7)
 
-        obs_n = jnp.concatenate([
-            timestep_cos,
-            timestep_sin,
-            joint_position_observation,
-            joint_velocity_observation,
-            center_of_mass_inertia_observation,
-            center_of_mass_velocity_observation,
-            projected_gravity_observation,
-            actuator_force_observation,
-            base_position_observation,
-            base_orientation_observation,
-            base_linear_velocity_observation,
-            base_angular_velocity_observation,
-            joystick_command_one_hot,
-        ])
+        obs_n = jnp.concatenate(
+            [
+                timestep_cos,
+                timestep_sin,
+                joint_position_observation,
+                joint_velocity_observation,
+                center_of_mass_inertia_observation,
+                center_of_mass_velocity_observation,
+                projected_gravity_observation,
+                actuator_force_observation,
+                base_position_observation,
+                base_orientation_observation,
+                base_linear_velocity_observation,
+                base_angular_velocity_observation,
+                joystick_command_one_hot,
+            ]
+        )
 
         return model.forward(obs_n)
 
@@ -768,7 +772,7 @@ if __name__ == "__main__":
     #   python -m examples.walking num_envs=8 batch_size=4
     # To use distributed training, add use_distributed=True:
     #   python -m examples.walking use_distributed=True num_envs=8 batch_size=4
-    
+
     config = HumanoidWalkingTaskConfig(
         # Training parameters.
         num_envs=2048,
@@ -789,11 +793,13 @@ if __name__ == "__main__":
         # Checkpointing parameters.
         save_every_n_seconds=60,
     )
-    
+
     # Choose the appropriate task class based on configuration
-    if config.use_distributed:
-        TaskClass = HumanoidWalkingDistributedTask
-    else:
-        TaskClass = HumanoidWalkingTask
-    
+    def get_task_class() -> Type[Any]:
+        if config.use_distributed:
+            return HumanoidWalkingDistributedTask
+        else:
+            return HumanoidWalkingTask
+
+    TaskClass = get_task_class()
     TaskClass.launch(config)
