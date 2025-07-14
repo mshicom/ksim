@@ -1,12 +1,10 @@
 """Distributed humanoid walking task implementation using multi-GPU training."""
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic, TypeVar
 
 import distrax
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -18,20 +16,16 @@ import ksim
 
 # Import components from the regular walking example
 from examples.walking import (
-    NUM_JOINTS,
-    NUM_INPUTS, 
-    ZEROS,
     Actor,
     Critic,
-    Model,
     HumanoidWalkingTaskConfig,
-    HumanoidWalkingTask,
+    Model,
 )
 
 
 @xax.jit(static_argnames=["num_joints", "std"])
 def _create_initial_positions_distributed(
-    num_joints: int, 
+    num_joints: int,
     std: float,
     zeros_data: dict[str, float],
     rng: PRNGKeyArray,
@@ -39,30 +33,30 @@ def _create_initial_positions_distributed(
 ) -> Array:
     """Creates initial joint positions for distributed training."""
     key_initial, key_noise = jax.random.split(rng)
-    
+
     # Create base positions using zeros
     initial_positions = jnp.zeros((num_envs, num_joints))
-    for joint_name, position in zeros_data.items():
+    for _joint_name, _position in zeros_data.items():
         # This is a simplified version - in reality you'd need joint indexing
         pass  # Joint assignment logic would go here
-    
+
     # Add noise
     noise = jax.random.normal(key_noise, (num_envs, num_joints)) * std
     return initial_positions + noise
 
 
-@jax.tree_util.register_dataclass  
+@jax.tree_util.register_dataclass
 @dataclass
 class HumanoidWalkingDistributedConfig(ksim.DistributedPPOConfig, HumanoidWalkingTaskConfig):
     """Configuration for distributed humanoid walking task."""
-    
+
     # Override defaults for distributed training
     num_envs: int = xax.field(
         value=16,
         help="The number of training environments to run in parallel (will be sharded across devices).",
     )
     batch_size: int = xax.field(
-        value=8, 
+        value=8,
         help="The number of trajectories to process in each minibatch during gradient updates.",
     )
 
@@ -72,7 +66,7 @@ Config = TypeVar("Config", bound=HumanoidWalkingDistributedConfig)
 
 class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Config]):
     """Distributed humanoid walking task using multi-GPU training."""
-    
+
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -182,7 +176,7 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
             depth=self.config.depth,
             num_mixtures=self.config.num_mixtures,
         )
-    
+
     def get_initial_model_carry(self, rng: PRNGKeyArray) -> None:
         """Returns the initial carry for the model."""
         return None
@@ -195,7 +189,7 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
     ) -> distrax.Distribution:
         # Same as original walking task
         timestep_1 = observations["timestep_observation"]
-        dh_joint_pos_j = observations["joint_position_observation"] 
+        dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         com_inertia_n = observations["center_of_mass_inertia_observation"]
         com_vel_n = observations["center_of_mass_velocity_observation"]
@@ -317,11 +311,11 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
     def _get_initial_model(self, rng: PRNGKeyArray) -> Model:
         """Gets the initial model."""
         return self.get_model(rng)
-    
+
     def _get_initial_env_state(self, rng: PRNGKeyArray) -> ksim.RolloutEnvState:
         """Gets the initial environment state."""
         # This would typically be initialized through the base RL task setup
-        # For now, return a placeholder - this would need to be implemented based on 
+        # For now, return a placeholder - this would need to be implemented based on
         # the full rollout initialization logic
         return ksim.RolloutEnvState(
             commands=xax.FrozenDict({}),
@@ -330,11 +324,11 @@ class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Co
             reward_carry=xax.FrozenDict({}),
             curriculum_state=None,  # Would be properly initialized
         )
-    
+
     def _get_initial_model_carry(self) -> None:
         """Gets the initial model carry state."""
         return None  # This model doesn't use carry state
-    
+
     def _rollout(
         self,
         model: Model,
@@ -353,32 +347,33 @@ if __name__ == "__main__":
     # To run distributed training, use:
     #   python -m examples.walking_distributed num_envs=16 batch_size=8
     # To test with simulated devices:
-    #   XLA_FLAGS='--xla_force_host_platform_device_count=2' python -m examples.walking_distributed num_envs=8 batch_size=4
-    
+    #   XLA_FLAGS='--xla_force_host_platform_device_count=2' python -m examples.walking_distributed \
+    #   num_envs=8 batch_size=4
+
     config = HumanoidWalkingDistributedConfig(
         # Distributed training parameters
         num_envs=16,  # Will be sharded across available devices
         batch_size=8,
-        pmap_axis_name="device", 
+        pmap_axis_name="device",
         grad_sync_period=1,
-        
+
         # Standard training parameters
         num_passes=2,
         epochs_per_log_step=1,
         rollout_length_seconds=8.0,
         global_grad_clip=2.0,
-        
-        # Simulation parameters  
+
+        # Simulation parameters
         dt=0.002,
         ctrl_dt=0.02,
         iterations=3,
         ls_iterations=5,
         action_latency_range=(0.005, 0.01),
         drop_action_prob=0.01,
-        
+
         # Checkpointing parameters
         save_every_n_seconds=60,
     )
-    
+
     task = HumanoidWalkingDistributedTask(config)
     task.run_distributed_training()
