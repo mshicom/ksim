@@ -37,3 +37,4 @@ run_*/
 .jaxcache/
 .DS_Store
 MUJOCO_LOG.TXT
+test_distributed.py

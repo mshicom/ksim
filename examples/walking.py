@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Any, Generic, Type, TypeVar
 
 import distrax
 import equinox as eqx
@@ -218,11 +218,19 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="The body id to track with the render camera.",
     )
 
+    # Distributed training parameters.
+    use_distributed: bool = xax.field(
+        value=True,
+        help="Whether to use distributed training across multiple devices.",
+    )
+
 
 Config = TypeVar("Config", bound=HumanoidWalkingTaskConfig)
 
 
 class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
+    """Single-device humanoid walking task."""
+
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -512,6 +520,274 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         return ksim.Action(action=action_j, carry=None)
 
 
+class HumanoidWalkingDistributedTask(ksim.DistributedPPOTask[Config], Generic[Config]):
+    """Multi-device distributed humanoid walking task."""
+
+    def get_optimizer(self) -> optax.GradientTransformation:
+        return (
+            optax.adam(self.config.learning_rate)
+            if self.config.adam_weight_decay == 0.0
+            else optax.adamw(self.config.learning_rate, weight_decay=self.config.adam_weight_decay)
+        )
+
+    def get_mujoco_model(self) -> mujoco.MjModel:
+        mjcf_path = (Path(__file__).parent / "data" / "scene.mjcf").resolve().as_posix()
+        return mujoco.MjModel.from_xml_path(mjcf_path)
+
+    def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> ksim.Metadata:
+        return ksim.Metadata.from_model(
+            mj_model,
+            kp=100.0,
+            kd=5.0,
+            armature=1e-4,
+            friction=1e-6,
+        )
+
+    def get_actuators(
+        self,
+        physics_model: ksim.PhysicsModel,
+        metadata: ksim.Metadata | None = None,
+    ) -> ksim.Actuators:
+        assert metadata is not None, "Metadata is required"
+        return ksim.PositionActuators(
+            physics_model=physics_model,
+            metadata=metadata,
+        )
+
+    def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
+        return [
+            ksim.StaticFrictionRandomizer(),
+            ksim.ArmatureRandomizer(),
+            ksim.MassMultiplicationRandomizer.from_body_name(physics_model, "torso"),
+            ksim.JointDampingRandomizer(),
+            ksim.JointZeroPositionRandomizer(),
+        ]
+
+    def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
+        return [
+            ksim.LinearPushEvent(
+                linvel=1.0,
+                interval_range=(2.0, 5.0),
+            ),
+            ksim.JumpEvent(
+                jump_height_range=(1.0, 2.0),
+                interval_range=(2.0, 5.0),
+            ),
+            ksim.JointPerturbationEvent(
+                std=50.0,
+                mask_prct=0.9,
+                interval_range=(0.1, 0.15),
+                curriculum_range=(1.0, 1.0),
+            ),
+        ]
+
+    def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
+        return [
+            ksim.get_xy_position_reset(physics_model),
+            ksim.RandomJointPositionReset(scale=0.01, zeros=tuple(v for _, v in ZEROS)),
+            ksim.RandomJointVelocityReset(scale=0.1),
+            ksim.RandomBaseVelocityXYReset(scale=0.2),
+        ]
+
+    def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
+        return [
+            ksim.TimestepObservation(),
+            ksim.JointPositionObservation(),
+            ksim.JointVelocityObservation(),
+            ksim.CenterOfMassInertiaObservation(),
+            ksim.CenterOfMassVelocityObservation(),
+            ksim.ProjectedGravityObservation.create(
+                physics_model=physics_model,
+                framequat_name="orientation",
+                lag_range=(0.3, 0.7),
+                noise=0.0,
+            ),
+            ksim.ActuatorForceObservation(),
+            ksim.BasePositionObservation(),
+            ksim.BaseOrientationObservation(),
+            ksim.BaseLinearVelocityObservation(),
+            ksim.BaseAngularVelocityObservation(),
+        ]
+
+    def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
+        return [
+            ksim.JoystickCommand(),
+        ]
+
+    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
+        return [
+            ksim.StayAliveReward(scale=1.0),
+            ksim.JoystickReward(
+                forward_speed=self.config.target_linear_velocity,
+                backward_speed=self.config.target_linear_velocity / 2.0,
+                strafe_speed=self.config.target_linear_velocity / 2.0,
+                rotation_speed=self.config.target_angular_velocity,
+                scale=1.0,
+            ),
+        ]
+
+    def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
+        return [
+            ksim.BadZTermination(unhealthy_z_lower=0.9, unhealthy_z_upper=1.6),
+            ksim.FarFromOriginTermination(max_dist=10.0),
+        ]
+
+    def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
+        return ksim.EpisodeLengthCurriculum(
+            num_levels=self.config.num_curriculum_levels,
+            increase_threshold=self.config.increase_threshold,
+            decrease_threshold=self.config.decrease_threshold,
+            min_level_steps=self.config.min_level_steps,
+        )
+
+    def get_model(self, key: PRNGKeyArray) -> Model:
+        return Model(
+            key,
+            hidden_size=self.config.hidden_size,
+            depth=self.config.depth,
+            num_mixtures=self.config.num_mixtures,
+        )
+
+    def get_initial_model_carry(self, rng: PRNGKeyArray) -> None:
+        return None
+
+    def run_actor(
+        self,
+        model: Actor,
+        observations: xax.FrozenDict[str, Array],
+        commands: xax.FrozenDict[str, Array],
+    ) -> distrax.Distribution:
+        # Processes the observations and commands.
+        timestep_observation = observations["timestep_observation"]
+        timestep_cos = jnp.cos(2 * jnp.pi * timestep_observation)
+        timestep_sin = jnp.sin(2 * jnp.pi * timestep_observation)
+
+        joint_position_observation = observations["joint_position_observation"]
+        joint_velocity_observation = observations["joint_velocity_observation"] / 10.0
+        center_of_mass_inertia_observation = observations["center_of_mass_inertia_observation"]
+        center_of_mass_velocity_observation = observations["center_of_mass_velocity_observation"]
+        projected_gravity_observation = observations["projected_gravity_observation"]
+        actuator_force_observation = observations["actuator_force_observation"] / 100.0
+        base_position_observation = observations["base_position_observation"]
+        base_orientation_observation = observations["base_orientation_observation"]
+        base_linear_velocity_observation = observations["base_linear_velocity_observation"]
+        base_angular_velocity_observation = observations["base_angular_velocity_observation"]
+
+        joystick_command = commands["joystick_command"]
+        joystick_command_one_hot = jax.nn.one_hot(joystick_command, 7)
+
+        obs_n = jnp.concatenate(
+            [
+                timestep_cos,
+                timestep_sin,
+                joint_position_observation,
+                joint_velocity_observation,
+                center_of_mass_inertia_observation,
+                center_of_mass_velocity_observation,
+                projected_gravity_observation,
+                actuator_force_observation,
+                base_position_observation,
+                base_orientation_observation,
+                base_linear_velocity_observation,
+                base_angular_velocity_observation,
+                joystick_command_one_hot,
+            ]
+        )
+
+        return model.forward(obs_n)
+
+    def run_critic(
+        self,
+        model: Critic,
+        observations: xax.FrozenDict[str, Array],
+        commands: xax.FrozenDict[str, Array],
+    ) -> Array:
+        # Processes the observations and commands.
+        timestep_observation = observations["timestep_observation"]
+        timestep_cos = jnp.cos(2 * jnp.pi * timestep_observation)
+        timestep_sin = jnp.sin(2 * jnp.pi * timestep_observation)
+
+        joint_position_observation = observations["joint_position_observation"]
+        joint_velocity_observation = observations["joint_velocity_observation"] / 10.0
+        center_of_mass_inertia_observation = observations["center_of_mass_inertia_observation"]
+        center_of_mass_velocity_observation = observations["center_of_mass_velocity_observation"]
+        projected_gravity_observation = observations["projected_gravity_observation"]
+        actuator_force_observation = observations["actuator_force_observation"] / 100.0
+        base_position_observation = observations["base_position_observation"]
+        base_orientation_observation = observations["base_orientation_observation"]
+        base_linear_velocity_observation = observations["base_linear_velocity_observation"]
+        base_angular_velocity_observation = observations["base_angular_velocity_observation"]
+
+        joystick_command = commands["joystick_command"]
+        joystick_command_one_hot = jax.nn.one_hot(joystick_command, 7)
+
+        obs_n = jnp.concatenate(
+            [
+                timestep_cos,
+                timestep_sin,
+                joint_position_observation,
+                joint_velocity_observation,
+                center_of_mass_inertia_observation,
+                center_of_mass_velocity_observation,
+                projected_gravity_observation,
+                actuator_force_observation,
+                base_position_observation,
+                base_orientation_observation,
+                base_linear_velocity_observation,
+                base_angular_velocity_observation,
+                joystick_command_one_hot,
+            ]
+        )
+
+        return model.forward(obs_n)
+
+    def get_ppo_variables(
+        self,
+        model: Model,
+        trajectory: ksim.Trajectory,
+        model_carry: None,
+        rng: PRNGKeyArray,
+    ) -> tuple[ksim.PPOVariables, None]:
+        # Vectorize over the time dimensions.
+        def get_log_prob(transition: ksim.Trajectory) -> Array:
+            action_dist_tj = self.run_actor(model.actor, transition.obs, transition.command)
+            log_probs_tj = action_dist_tj.log_prob(transition.action)
+            assert isinstance(log_probs_tj, Array)
+            return log_probs_tj
+
+        log_probs_tj = jax.vmap(get_log_prob)(trajectory)
+        assert isinstance(log_probs_tj, Array)
+
+        # Vectorize over the time dimensions.
+        values_tj = jax.vmap(self.run_critic, in_axes=(None, 0, 0))(model.critic, trajectory.obs, trajectory.command)
+
+        ppo_variables = ksim.PPOVariables(
+            log_probs=log_probs_tj,
+            values=values_tj.squeeze(-1),
+        )
+
+        return ppo_variables, None
+
+    def sample_action(
+        self,
+        model: Model,
+        model_carry: None,
+        physics_model: ksim.PhysicsModel,
+        physics_state: ksim.PhysicsState,
+        observations: xax.FrozenDict[str, Array],
+        commands: xax.FrozenDict[str, Array],
+        rng: PRNGKeyArray,
+        argmax: bool,
+    ) -> ksim.Action:
+        action_dist_j = self.run_actor(
+            model=model.actor,
+            observations=observations,
+            commands=commands,
+        )
+        action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
+        return ksim.Action(action=action_j, carry=None)
+
+
 if __name__ == "__main__":
     # To run training, use the following command:
     #   python -m examples.walking
@@ -521,25 +797,36 @@ if __name__ == "__main__":
     # of environments and batch size to reduce memory usage. Here's an example
     # from the command line:
     #   python -m examples.walking num_envs=8 batch_size=4
-    HumanoidWalkingTask.launch(
-        HumanoidWalkingTaskConfig(
-            # Training parameters.
-            num_envs=2048,
-            batch_size=256,
-            num_passes=2,
-            epochs_per_log_step=1,
-            rollout_length_seconds=8.0,
-            global_grad_clip=2.0,
-            # Logging parameters.
-            valid_first_n_steps=1,
-            # Simulation parameters.
-            dt=0.002,
-            ctrl_dt=0.02,
-            iterations=3,
-            ls_iterations=5,
-            action_latency_range=(0.005, 0.01),
-            drop_action_prob=0.01,
-            # Checkpointing parameters.
-            save_every_n_seconds=60,
-        ),
+    # To use distributed training, add use_distributed=True:
+    #   python -m examples.walking use_distributed=True num_envs=8 batch_size=4
+
+    config = HumanoidWalkingTaskConfig(
+        # Training parameters.
+        num_envs=2048,
+        batch_size=256,
+        num_passes=2,
+        epochs_per_log_step=1,
+        rollout_length_seconds=8.0,
+        global_grad_clip=2.0,
+        # Logging parameters.
+        valid_first_n_steps=1,
+        # Simulation parameters.
+        dt=0.002,
+        ctrl_dt=0.02,
+        iterations=3,
+        ls_iterations=5,
+        action_latency_range=(0.005, 0.01),
+        drop_action_prob=0.01,
+        # Checkpointing parameters.
+        save_every_n_seconds=60,
     )
+
+    # Choose the appropriate task class based on configuration
+    def get_task_class() -> Type[Any]:
+        if config.use_distributed:
+            return HumanoidWalkingDistributedTask
+        else:
+            return HumanoidWalkingTask
+
+    TaskClass = get_task_class()
+    TaskClass.launch(config)
