@@ -7,20 +7,11 @@ from jaxtyping import Array, PRNGKeyArray, PyTree
 from typing import Generic, TypeVar
 from dataclasses import dataclass
 from ksim.task.ppo import PPOConfig
-from ksim.task.distributed_ppo import DistributedPPOTask, DistributedPPOConfig
+from ksim.task.distributed_ppo import DistributedPPOTask
 from examples.walking import HumanoidWalkingTaskConfig, HumanoidWalkingTask
 
-@dataclass
-class DistributedHumanoidWalkingConfig(HumanoidWalkingTaskConfig, DistributedPPOConfig):
-    """Config for the distributed humanoid walking task."""
-    
-    # Distribution-specific parameters
-    max_devices_per_host: int | None = None  # Use all available devices
-    gradient_sync_period: int = 1  # Sync gradients every step
-    verify_state_consistency: bool = True
 
-
-Config = TypeVar("Config", bound=DistributedHumanoidWalkingConfig)
+Config = TypeVar("Config", bound=HumanoidWalkingTaskConfig)
 
 
 class DistributedHumanoidWalkingTask(DistributedPPOTask[Config], Generic[Config]):
@@ -50,18 +41,13 @@ class DistributedHumanoidWalkingTask(DistributedPPOTask[Config], Generic[Config]
 
 
 if __name__ == "__main__":
-    # Print device information
-    print(f"JAX devices: {jax.devices()}")
-    print(f"Local device count: {jax.local_device_count()}")
-    print(f"Process count: {jax.process_count()}")
-    
     # Launch the distributed training
     DistributedHumanoidWalkingTask.launch(
-        DistributedHumanoidWalkingConfig(
+        HumanoidWalkingTaskConfig(
             max_steps=3,
             # Training parameters
-            num_envs=2048,
-            batch_size=256,
+            num_envs=16,
+            batch_size=4,
             num_passes=2,
             epochs_per_log_step=1,
             rollout_length_seconds=0.1,
@@ -77,8 +63,5 @@ if __name__ == "__main__":
             drop_action_prob=0.01,
             # Checkpointing parameters
             save_every_n_seconds=60,
-            # Distribution parameters
-            max_devices_per_host=None,  # Use all available devices
-            gradient_sync_period=1,     # Sync gradients every step
         ),
     )
