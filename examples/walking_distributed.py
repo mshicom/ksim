@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from ksim.task.ppo import PPOConfig
 from ksim.task.distributed_ppo import DistributedPPOTask
 from examples.walking import HumanoidWalkingTaskConfig, HumanoidWalkingTask
+import ksim
 
 
 Config = TypeVar("Config", bound=HumanoidWalkingTaskConfig)
@@ -23,7 +24,7 @@ class DistributedHumanoidWalkingTask(DistributedPPOTask[Config], Generic[Config]
     get_mujoco_model_metadata = HumanoidWalkingTask.get_mujoco_model_metadata
     get_actuators = HumanoidWalkingTask.get_actuators
     get_physics_randomizers = HumanoidWalkingTask.get_physics_randomizers
-    get_events = HumanoidWalkingTask.get_events
+    # get_events = HumanoidWalkingTask.get_events  # Temporarily disable events
     get_resets = HumanoidWalkingTask.get_resets
     get_observations = HumanoidWalkingTask.get_observations
     get_commands = HumanoidWalkingTask.get_commands
@@ -36,6 +37,10 @@ class DistributedHumanoidWalkingTask(DistributedPPOTask[Config], Generic[Config]
     run_critic = HumanoidWalkingTask.run_critic
     get_ppo_variables = HumanoidWalkingTask.get_ppo_variables
     sample_action = HumanoidWalkingTask.sample_action
+
+    # Temporarily disable events for distributed training
+    def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
+        return []  # No events to avoid vectorization issues
 
     # Only override methods that need to be distributed
 

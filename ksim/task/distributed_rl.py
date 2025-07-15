@@ -98,23 +98,47 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
                 f"number of devices ({num_devices})."
             )
         
-        # Reshape env_states to have leading device axis 
-        def reshape_for_pmap(x: Any) -> Any:
-            if not hasattr(x, 'shape') or x.shape == ():
-                return jnp.repeat(x[None], num_devices)
-            return x.reshape(num_devices, num_envs_per_device, *x.shape[1:])        
-        sharded_env_states = jax.tree.map(reshape_for_pmap, carry.env_states)
+        # Fix scalars and reshape arrays for distributed training
+        def fix_scalars_and_shard_envs(x):
+            """Fix scalars and shard environment arrays."""
+            if hasattr(x, 'shape'):
+                if x.shape == ():
+                    # Scalar - add device dimension
+                    return jnp.broadcast_to(x, (num_devices,))
+                elif len(x.shape) > 0 and x.shape[0] == self.config.num_envs:
+                    # Environment-batched array - reshape to (devices, envs_per_device, ...)
+                    return x.reshape(num_devices, num_envs_per_device, *x.shape[1:])
+                else:
+                    # Other arrays - add device dimension
+                    return jnp.broadcast_to(x, (num_devices,) + x.shape)
+            else:
+                return x
         
-        # Replicate and add leading device axis to shared_state
-        def replicate_for_pmap(x: Any) -> Any:
-            return jnp.repeat(x[None], num_devices, axis=0)
-        replicated_shared_state = jax.tree.map(replicate_for_pmap, carry.shared_state)
+        def fix_scalars_only(x):
+            """Fix only scalar arrays."""
+            if hasattr(x, 'shape') and x.shape == ():
+                return jnp.broadcast_to(x, (num_devices,))
+            else:
+                return x
         
-        # Update carry with sharded env_states and replicated shared_state
+        # Prepare env_states for pmap (will be passed with in_axes=0)
+        distributed_env_states = jax.tree.map(fix_scalars_and_shard_envs, carry.env_states)
+        
+        # Prepare shared_state (will be passed with in_axes=None, so don't add device dim)
+        distributed_shared_state = jax.tree.map(fix_scalars_only, carry.shared_state)
+        
+        # Prepare opt_state for pmap (will be passed with in_axes=0)
+        distributed_opt_state = jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (num_devices,) + x.shape) if hasattr(x, 'shape') else x,
+            carry.opt_state
+        )
+        
+        # Create distributed carry
         distributed_carry = replace(
             carry,
-            env_states=sharded_env_states,
-            shared_state=replicated_shared_state,
+            env_states=distributed_env_states,
+            shared_state=distributed_shared_state,
+            opt_state=distributed_opt_state,
         )
         
         return constants, distributed_carry, state
@@ -137,23 +161,33 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
     @xax.jit(static_argnames=["self", "constants"], jit_level=JitLevel.OUTER_LOOP)
     def _distributed_train_loop_step(
         self,
-        carry: RLLoopCarry,
+        env_states: RolloutEnvState,
+        shared_state: RolloutSharedState,
+        opt_state: PyTree,
         constants: RLLoopConstants,
-        state: xax.State,
         rng: PRNGKeyArray,
-    ) -> tuple[RLLoopCarry, Metrics, LoggedTrajectory]:
+    ) -> tuple[RolloutEnvState, RolloutSharedState, PyTree, Metrics, LoggedTrajectory, Trajectory, RewardState]:
         """Distributed version of the training loop step."""
-        # Runs a single step of the distributed RL training loop
-        # This method will be pmapped across devices
+        # Reconstruct carry from separate components
+        carry = RLLoopCarry(
+            env_states=env_states,
+            shared_state=shared_state,
+            opt_state=opt_state,
+        )
         
         # Split RNG for different operations
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
         
-        # Rolls out a new trajectory
-        trajectory, rewards, next_env_state = self._single_unroll(
-            constants=constants.constants,
-            env_states=carry.env_states,
-            shared_state=carry.shared_state,
+        # Rolls out a new trajectory using vmap like the base implementation
+        vmapped_unroll = xax.vmap(
+            self._single_unroll,
+            in_axes=(None, 0, None),
+            jit_level=JitLevel.UNROLL,
+        )
+        trajectory, rewards, next_env_state = vmapped_unroll(
+            constants.constants,
+            carry.env_states,
+            carry.shared_state,
         )
         
         # Update the model on the trajectory
@@ -163,23 +197,6 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
             trajectories=trajectory,
             rewards=rewards,
             rng=update_rng,
-        )
-        
-        # Steps the curriculum
-        curriculum_state = constants.constants.curriculum(
-            trajectory=trajectory,
-            rewards=rewards,
-            training_state=state,
-            prev_state=next_env_state.curriculum_state,
-        )
-        
-        # Update the curriculum state
-        next_carry = replace(
-            next_carry,
-            env_states=replace(
-                next_carry.env_states,
-                curriculum_state=curriculum_state,
-            ),
         )
         
         # Convert any array with more than one element to a histogram
@@ -192,7 +209,8 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
             curriculum_level=next_carry.env_states.curriculum_state.level,
         )
         
-        return next_carry, metrics, logged_traj
+        return (next_carry.env_states, next_carry.shared_state, next_carry.opt_state, 
+                metrics, logged_traj, trajectory, rewards)
     
     def run_training(self) -> None:
         """Override run_training to use distributed training with multiple GPUs."""
@@ -240,10 +258,10 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
             
             # Create pmapped version of distributed_train_loop_step
             pmapped_train_step = jax.pmap(
-                lambda c, const, s, r: self._distributed_train_loop_step(c, const, s, r),
-                in_axes=(0, None, None, 0),
+                lambda env_st, sh_st, opt_st, const, r: self._distributed_train_loop_step(env_st, sh_st, opt_st, const, r),
+                in_axes=(0, None, 0, None, 0),
                 axis_name=_PMAP_AXIS_NAME,
-                static_broadcasted_argnums=(1, ),
+                static_broadcasted_argnums=(3, ),
             )
 
             # Check for weak types that could slow down compilation
@@ -291,11 +309,47 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
                         update_rngs = jax.random.split(update_rng, num_devices)
                         
                         # Run distributed training step
-                        carry, metrics_tuple, logged_trajs = pmapped_train_step(
-                            carry,
+                        (next_env_states, next_shared_state, next_opt_state, 
+                         metrics_tuple, logged_trajs, trajectories, rewards_data) = pmapped_train_step(
+                            carry.env_states,
+                            carry.shared_state,
+                            carry.opt_state,
                             constants,
-                            state,
                             update_rngs,
+                        )
+                        
+                        # Reconstruct carry from components
+                        carry = RLLoopCarry(
+                            env_states=next_env_states,
+                            shared_state=next_shared_state,
+                            opt_state=next_opt_state,
+                        )
+                        
+                        # Update curriculum state (single device operation using first device's data)
+                        first_device_trajectory = jax.tree.map(lambda x: x[0], trajectories)
+                        first_device_rewards = jax.tree.map(lambda x: x[0], rewards_data)
+                        first_device_curriculum_state = jax.tree.map(lambda x: x[0], carry.env_states.curriculum_state)
+                        
+                        new_curriculum_state = constants.constants.curriculum(
+                            trajectory=first_device_trajectory,
+                            rewards=first_device_rewards,
+                            training_state=state,
+                            prev_state=first_device_curriculum_state,
+                        )
+                        
+                        # Broadcast the updated curriculum state to all devices
+                        broadcasted_curriculum_state = jax.tree.map(
+                            lambda x: jnp.repeat(x[None], num_devices, axis=0),
+                            new_curriculum_state
+                        )
+                        
+                        # Update carry with the new curriculum state
+                        carry = replace(
+                            carry,
+                            env_states=replace(
+                                carry.env_states,
+                                curriculum_state=broadcasted_curriculum_state,
+                            ),
                         )
                         
                         # Gather metrics from all devices (take mean across devices)
