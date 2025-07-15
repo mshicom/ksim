@@ -178,11 +178,16 @@ class DistributedRLTask(RLTask[Config], Generic[Config], ABC):
         # Split RNG for different operations
         rng, rollout_rng, update_rng = jax.random.split(rng, 3)
         
-        # Rolls out a new trajectory
-        trajectory, rewards, next_env_state = self._single_unroll(
-            constants=constants.constants,
-            env_state=carry.env_states,
-            shared_state=carry.shared_state,
+        # Rolls out a new trajectory using vmap like the base implementation
+        vmapped_unroll = xax.vmap(
+            self._single_unroll,
+            in_axes=(None, 0, None),
+            jit_level=JitLevel.UNROLL,
+        )
+        trajectory, rewards, next_env_state = vmapped_unroll(
+            constants.constants,
+            carry.env_states,
+            carry.shared_state,
         )
         
         # Update the model on the trajectory
