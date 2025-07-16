@@ -1,5 +1,8 @@
 """Benchmark script for RLTask step_engine with vmap and pmap operations."""
 
+import os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+
 import argparse
 import time
 from typing import Callable, Dict, List, Tuple
@@ -12,7 +15,8 @@ import xax
 from tabulate import tabulate
 
 from ksim.task.rl import RLTask, RolloutConstants, RolloutEnvState, RolloutSharedState
-from tests.wip_test_rl_vmap_pmap import TestRLConfig, TestRLTask
+from ksim.task.rl import get_initial_commands, get_initial_obs_carry, get_initial_reward_carry, get_physics_randomizers
+from wip_test_rl_vmap_pmap import TestRLConfig, TestRLTask
 
 
 def time_function(func: Callable, *args, **kwargs) -> float:
@@ -83,13 +87,29 @@ def benchmark_step_engine(
         
         # Create environment states for each device
         def create_env_states_for_device(device_rngs):
-            return jax.vmap(task._get_env_state)(
-                rng=device_rngs,
-                rollout_constants=constants,
-                mj_model=mj_model,
-                physics_model=mjx_model,
-                randomizers=task.get_physics_randomizers(mjx_model),
-            )
+            def create_env_state(init_rng):
+                # Setup environment state
+                curriculum_state = constants.curriculum.get_initial_state(init_rng)
+                physics_state = constants.engine.reset(mjx_model, curriculum_state.level, init_rng)
+                
+                randomizations = get_physics_randomizers(mjx_model, task.get_physics_randomizers(mjx_model), init_rng)
+                commands = get_initial_commands(init_rng, physics_state.data, constants.commands, curriculum_state.level)
+                obs_carry = get_initial_obs_carry(init_rng, physics_state, constants.observations)
+                reward_carry = get_initial_reward_carry(init_rng, constants.rewards)
+                model_carry = task.get_initial_model_carry(init_rng)
+                
+                return RolloutEnvState(
+                    commands=commands,
+                    physics_state=physics_state,
+                    randomization_dict=randomizations,
+                    model_carry=model_carry,
+                    reward_carry=reward_carry,
+                    obs_carry=obs_carry,
+                    curriculum_state=curriculum_state,
+                    rng=init_rng,
+                )
+            
+            return jax.vmap(create_env_state)(device_rngs)
         
         env_states = jax.pmap(create_env_states_for_device)(rngs)
         
@@ -99,36 +119,55 @@ def benchmark_step_engine(
             model_arrs=(model_arrs,),
             aux_values=xax.FrozenDict({}),
         )
-        shared_state_pmap = jax.tree_map(
+        shared_state_pmap = jax.tree.map(
             lambda x: jnp.array([x] * num_devices),
             shared_state
         )
         
         # Create vmapped and pmapped step_engine
-        vmap_step_engine = jax.vmap(
-            lambda env_state, shared_state: task.step_engine(
+        def step_wrapper(env_state, shared_state):
+            return task.step_engine(
                 constants=constants,
                 env_states=env_state,
                 shared_state=shared_state,
             )
-        )
+        
+        vmap_step_engine = jax.vmap(step_wrapper)
         step_fn = jax.pmap(vmap_step_engine)
         
         def run_step():
-            return step_fn(env_states=env_states, shared_state=shared_state_pmap)
-        
+            return step_fn(env_states, shared_state_pmap)
+                
     else:
         # Just use vmap
         rngs = jax.random.split(rng, num_envs)
         
         # Create environment states
-        env_states = jax.vmap(task._get_env_state)(
-            rng=rngs,
-            rollout_constants=constants,
-            mj_model=mj_model,
-            physics_model=mjx_model,
-            randomizers=task.get_physics_randomizers(mjx_model),
-        )
+        def create_env_state(init_rng):
+            # Setup environment state
+            curriculum_state = constants.curriculum.get_initial_state(init_rng)
+            physics_state = constants.engine.reset(mjx_model, curriculum_state.level, init_rng)
+            
+            randomizations = get_physics_randomizers(mjx_model, task.get_physics_randomizers(mjx_model), init_rng)
+            commands = get_initial_commands(init_rng, physics_state.data, constants.commands, curriculum_state.level)
+            obs_carry = get_initial_obs_carry(init_rng, physics_state, constants.observations)
+            reward_carry = get_initial_reward_carry(init_rng, constants.rewards)
+            model_carry = task.get_initial_model_carry(init_rng)
+            
+            return RolloutEnvState(
+                commands=commands,
+                physics_state=physics_state,
+                randomization_dict=randomizations,
+                model_carry=model_carry,
+                reward_carry=reward_carry,
+                obs_carry=obs_carry,
+                curriculum_state=curriculum_state,
+                rng=init_rng,
+            )
+        
+        # Create vectorized environment states
+        vmap_create_env_state = jax.vmap(create_env_state)
+        env_states = vmap_create_env_state(rngs)
         
         # Create shared state
         shared_state = RolloutSharedState(
@@ -138,14 +177,17 @@ def benchmark_step_engine(
         )
         
         # Create vmapped step_engine
-        step_fn = jax.vmap(task.step_engine, in_axes=(None, 0, None))
-        
-        def run_step():
-            return step_fn(
+        def step_wrapper(constants, env_states, shared_state):
+            return task.step_engine(
                 constants=constants,
                 env_states=env_states,
                 shared_state=shared_state,
             )
+        
+        step_fn = jax.vmap(step_wrapper, in_axes=(None, 0, None))
+        
+        def run_step():
+            return step_fn(constants, env_states, shared_state)
     
     init_time = (time.time() - start_init) * 1000
     
@@ -236,8 +278,8 @@ def run_benchmarks():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark RLTask step_engine")
-    parser.add_argument("--num_envs", type=int, default=16, help="Number of environments")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--num_envs", type=int, default=2048, help="Number of environments")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--rollout_length", type=float, default=0.1, help="Rollout length in seconds")
     parser.add_argument("--use_pmap", action="store_true", help="Use pmap for parallelization")
     
